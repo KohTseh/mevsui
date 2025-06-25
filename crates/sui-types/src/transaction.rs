@@ -3240,7 +3240,7 @@ impl ObjectReadResult {
 
 #[derive(Clone)]
 pub struct InputObjects {
-    objects: Vec<ObjectReadResult>,
+    pub objects: Vec<ObjectReadResult>,
 }
 
 impl std::fmt::Debug for InputObjects {
