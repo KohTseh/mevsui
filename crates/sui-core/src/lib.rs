@@ -8,6 +8,7 @@ pub mod authority;
 pub mod authority_aggregator;
 pub mod authority_client;
 pub mod authority_server;
+pub mod background_task_processor;
 pub mod checkpoints;
 pub mod congestion_tracker;
 pub mod consensus_adapter;

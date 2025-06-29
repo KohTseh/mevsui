@@ -2,6 +2,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::background_task_processor::BackgroundTaskProcessor;
 use crate::congestion_tracker::CongestionTracker;
 use crate::consensus_adapter::ConsensusOverloadChecker;
 use crate::execution_cache::ExecutionCacheTraitPointers;
@@ -922,6 +923,9 @@ pub struct AuthorityState {
     pub cache_update_handler: CacheUpdateHandler,
 
     pub tx_handler: TxHandler,
+
+    /// Background task processor for async operations
+    pub background_task_processor: BackgroundTaskProcessor,
 }
 
 /// The authority state encapsulates all state, drives execution, and ensures safety.
@@ -1700,7 +1704,6 @@ impl AuthorityState {
         // Clone data needed for async tasks before moving transaction_outputs
         let effects_for_tx_handler = transaction_outputs.effects.clone();
         let written_objects_for_cache = transaction_outputs.written.clone();
-        
         let is_system_tx = certificate.transaction_data().is_system_tx();
         let is_end_of_epoch_tx = certificate.transaction_data().is_end_of_epoch_tx();
 
@@ -1740,10 +1743,7 @@ impl AuthorityState {
 
                 // if our address's object is changed or there are swapEvents
                 if has_special || has_swap_events {
-                    let cache_handler = self.cache_update_handler.clone();
-                    tokio::spawn(async move {
-                        cache_handler.notify_written(changed_objects).await;
-                    });
+                    self.background_task_processor.submit_cache_update(changed_objects);
                 }
             }
         }
@@ -1759,12 +1759,10 @@ impl AuthorityState {
             && !sui_events.is_empty()
             && !written_objects_for_cache.is_empty()
         {
-            let tx_handler = self.tx_handler.clone();
-            tokio::spawn(async move {
-                let _ = tx_handler
-                    .send_tx_effects_and_events(&effects_for_tx_handler, sui_events)
-                    .await;
-            });
+            self.background_task_processor.submit_tx_effects_and_events(
+                effects_for_tx_handler,
+                sui_events,
+            );
         }
 
         match self.execution_scheduler.as_ref() {
@@ -3204,6 +3202,14 @@ impl AuthorityState {
         } else {
             None
         };
+
+        let cache_update_handler = CacheUpdateHandler::new();
+        let tx_handler = TxHandler::default();
+        let background_task_processor = BackgroundTaskProcessor::new(
+            cache_update_handler.clone(),
+            tx_handler.clone(),
+        );
+
         let state = Arc::new(AuthorityState {
             name,
             secret,
@@ -3228,8 +3234,9 @@ impl AuthorityState {
             chain_identifier,
             congestion_tracker: Arc::new(CongestionTracker::new()),
             traffic_controller,
-            cache_update_handler: CacheUpdateHandler::new(),
-            tx_handler: TxHandler::default(),
+            cache_update_handler: cache_update_handler.clone(),
+            tx_handler: tx_handler.clone(),
+            background_task_processor,
         });
 
         let state_clone = Arc::downgrade(&state);
