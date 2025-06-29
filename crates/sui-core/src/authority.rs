@@ -1697,6 +1697,13 @@ impl AuthorityState {
         let tx_digest = certificate.digest();
         let output_keys = transaction_outputs.output_keys.clone();
 
+        // Clone data needed for async tasks before moving transaction_outputs
+        let effects_for_tx_handler = transaction_outputs.effects.clone();
+        let written_objects_for_cache = transaction_outputs.written.clone();
+        
+        let is_system_tx = certificate.transaction_data().is_system_tx();
+        let is_end_of_epoch_tx = certificate.transaction_data().is_end_of_epoch_tx();
+
         // The insertion to epoch_store is not atomic with the insertion to the perpetual store. This is OK because
         // we insert to the epoch store first. And during lookups we always look up in the perpetual store first.
         epoch_store.insert_tx_key(&tx_key, tx_digest)?;
@@ -1708,9 +1715,8 @@ impl AuthorityState {
             .write_transaction_outputs(epoch_store.epoch(), transaction_outputs.into());
 
         // if system tx, skip
-        if !certificate.transaction_data().is_system_tx() {
-            let changed_objects: Vec<_> = transaction_outputs
-                .written
+        if !is_system_tx {
+            let changed_objects: Vec<_> = written_objects_for_cache
                 .iter()
                 .map(|(id, obj)| (*id, obj.clone()))
                 .collect();
@@ -1734,26 +1740,31 @@ impl AuthorityState {
 
                 // if our address's object is changed or there are swapEvents
                 if has_special || has_swap_events {
-                    tokio::spawn(self.cache_update_handler.notify_written(changed_objects));
+                    let cache_handler = self.cache_update_handler.clone();
+                    tokio::spawn(async move {
+                        cache_handler.notify_written(changed_objects).await;
+                    });
                 }
             }
         }
 
-        if certificate.transaction_data().is_end_of_epoch_tx() {
+        if is_end_of_epoch_tx {
             // At the end of epoch, since system packages may have been upgraded, force
             // reload them in the cache.
             self.get_object_cache_reader()
                 .force_reload_system_packages(&BuiltInFramework::all_package_ids());
         }
 
-        if !certificate.transaction_data().is_system_tx()
+        if !is_system_tx
             && !sui_events.is_empty()
-            && !transaction_outputs.written.is_empty()
+            && !written_objects_for_cache.is_empty()
         {
-            tokio::spawn(
-                self.tx_handler
-                    .send_tx_effects_and_events(&transaction_outputs.effects, sui_events),
-            );
+            let tx_handler = self.tx_handler.clone();
+            tokio::spawn(async move {
+                let _ = tx_handler
+                    .send_tx_effects_and_events(&effects_for_tx_handler, sui_events)
+                    .await;
+            });
         }
 
         match self.execution_scheduler.as_ref() {

@@ -30,7 +30,7 @@ pub fn pool_related_object_ids() -> DashSet<ObjectID> {
     set
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CacheUpdateHandler {
     socket_path: PathBuf,
     connections: Arc<Mutex<Vec<UnixStream>>>,

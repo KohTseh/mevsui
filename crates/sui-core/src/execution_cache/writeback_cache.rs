@@ -2383,7 +2383,7 @@ impl ExecutionCacheWrite for WritebackCache {
     fn update_package_cache<'a>(
         &'a self,
         package_updates: &'a [(ObjectID, Object)],
-    ) -> BoxFuture<'_, SuiResult> {
+    ) -> BoxFuture<'a, SuiResult> {
         WritebackCache::update_package_cache(self, package_updates).boxed()
     }
 }
