@@ -91,6 +91,7 @@ macro_rules! charge_gas {
 }
 
 /// Type wrapper around Value to ensure safe usage
+#[derive(Debug)]
 pub struct CtxValue(Value);
 
 enum LocationValue<'a> {
@@ -104,6 +105,9 @@ enum UsageKind {
     Copy,
     Borrow(/* mut */ bool),
 }
+
+// Type alias used to document borrowing the `imm_ref_temps` field
+type TempLocals = Vec<Locals>;
 
 /// Maintains all runtime state specific to programmable transactions
 pub struct Context<'env, 'pc, 'vm, 'state, 'linkage, 'gas> {
@@ -127,6 +131,9 @@ pub struct Context<'env, 'pc, 'vm, 'state, 'linkage, 'gas> {
     /// It will only not be 1 for Move calls with multiple return values.
     /// Inner values are None if taken/moved by-value
     results: Vec<Locals>,
+    // used by by-ref Pure inputs without fixed types. We must create one-off references to these
+    // values, which will be dropped at the end of the transaction.
+    imm_ref_temps: TempLocals,
 }
 
 impl<'env, 'pc, 'vm, 'state, 'linkage, 'gas> Context<'env, 'pc, 'vm, 'state, 'linkage, 'gas> {
@@ -189,6 +196,7 @@ impl<'env, 'pc, 'vm, 'state, 'linkage, 'gas> Context<'env, 'pc, 'vm, 'state, 'li
             gas,
             inputs,
             results: vec![],
+            imm_ref_temps: vec![],
         })
     }
 
@@ -225,7 +233,12 @@ impl<'env, 'pc, 'vm, 'state, 'linkage, 'gas> Context<'env, 'pc, 'vm, 'state, 'li
                 },
             );
             if let Some(object) = value {
-                self.transfer_object(owner, type_, CtxValue(object))?;
+                self.transfer_object_(
+                    owner,
+                    type_,
+                    CtxValue(object),
+                    /* end of transaction */ true,
+                )?;
             } else if owner.is_shared() {
                 by_value_shared_objects.insert(id);
             } else if matches!(owner, Owner::ConsensusAddressOwner { .. }) {
@@ -400,6 +413,7 @@ impl<'env, 'pc, 'vm, 'state, 'linkage, 'gas> Context<'env, 'pc, 'vm, 'state, 'li
         ty: Type,
     ) -> Result<
         (
+            &'a mut TempLocals,
             &'a mut GasCharger,
             &'env Env<'pc, 'vm, 'state, 'linkage>,
             LocationValue<'a>,
@@ -432,7 +446,7 @@ impl<'env, 'pc, 'vm, 'state, 'linkage, 'gas> Context<'env, 'pc, 'vm, 'state, 'li
                 }
             }
         };
-        Ok((self.gas_charger, self.env, v))
+        Ok((&mut self.imm_ref_temps, self.gas_charger, self.env, v))
     }
 
     fn location(
@@ -441,30 +455,38 @@ impl<'env, 'pc, 'vm, 'state, 'linkage, 'gas> Context<'env, 'pc, 'vm, 'state, 'li
         location: T::Location,
         ty: Type,
     ) -> Result<Value, ExecutionError> {
-        let (gas_charger, env, lv) = self.location_value(location, ty)?;
+        let (imm_ref_temps, gas_charger, env, lv) = self.location_value(location, ty)?;
         let mut local = match lv {
             LocationValue::Loaded(v) => v,
-            LocationValue::InputBytes(inputs, i, ty) => match usage {
-                UsageKind::Move | UsageKind::Borrow(true) => {
-                    let bytes = match inputs.get(i)? {
-                        InputValue::Bytes(v) => v,
-                        InputValue::Loaded(_) => invariant_violation!("Expected bytes"),
-                    };
-                    let value = load_byte_value(gas_charger, env, bytes, ty)?;
-                    inputs.fix(i, value)?;
-                    match inputs.get(i)? {
-                        InputValue::Loaded(v) => v,
-                        InputValue::Bytes(_) => invariant_violation!("Expected fixed value"),
+            LocationValue::InputBytes(inputs, i, ty) => {
+                let bytes = match inputs.get(i)? {
+                    InputValue::Bytes(v) => v,
+                    InputValue::Loaded(_) => invariant_violation!("Expected bytes"),
+                };
+                let value = load_byte_value(gas_charger, env, bytes, ty)?;
+                match usage {
+                    UsageKind::Borrow(true) => {
+                        // "fix" the BCS bytes to a given value
+                        inputs.fix(i, value)?;
+                        match inputs.get(i)? {
+                            InputValue::Loaded(v) => v,
+                            InputValue::Bytes(_) => invariant_violation!("Expected fixed value"),
+                        }
+                    }
+                    UsageKind::Borrow(false) => {
+                        // in the case that we need a reference but it is not "fixed", we must
+                        // create a temporary local to borrow
+                        imm_ref_temps.push(Locals::new(vec![value])?);
+                        let local = imm_ref_temps.last_mut().unwrap();
+                        local.local(0)?
+                    }
+                    UsageKind::Move | UsageKind::Copy => {
+                        // return a fresh copy of the value
+                        // Move should only happen for dev-inspect or `Receiving`
+                        return Ok(value);
                     }
                 }
-                UsageKind::Copy | UsageKind::Borrow(false) => {
-                    let bytes = match inputs.get(i)? {
-                        InputValue::Bytes(v) => v,
-                        InputValue::Loaded(_) => invariant_violation!("Expected bytes"),
-                    };
-                    return load_byte_value(gas_charger, env, bytes, ty);
-                }
-            },
+            }
         };
         Ok(match usage {
             UsageKind::Move => local.move_()?,
@@ -601,9 +623,10 @@ impl<'env, 'pc, 'vm, 'state, 'linkage, 'gas> Context<'env, 'pc, 'vm, 'state, 'li
     ) -> Result<Vec<CtxValue>, ExecutionError> {
         let ty_args = ty_args
             .iter()
-            .map(|ty| {
+            .enumerate()
+            .map(|(idx, ty)| {
                 self.env
-                    .load_vm_type_from_adapter_type(ty)
+                    .load_vm_type_argument_from_adapter_type(idx, ty)
                     .map(|(vm_ty, _)| vm_ty)
             })
             .collect::<Result<_, _>>()?;
@@ -727,23 +750,25 @@ impl<'env, 'pc, 'vm, 'state, 'linkage, 'gas> Context<'env, 'pc, 'vm, 'state, 'li
         linkage: &RootedLinkage,
         mut trace_builder_opt: Option<&mut MoveTraceBuilder>,
     ) -> Result<(), ExecutionError> {
-        let modules_to_init = modules.iter().filter_map(|module| {
-            for fdef in &module.function_defs {
-                let fhandle = module.function_handle_at(fdef.function);
-                let fname = module.identifier_at(fhandle.name);
-                if fname == INIT_FN_NAME {
-                    return Some(module.self_id());
-                }
-            }
-            None
-        });
-
-        for module_id in modules_to_init {
-            let args = vec![CtxValue(Value::tx_context(
-                self.tx_context.borrow().digest(),
-            )?)];
+        for module in modules {
+            let Some((_idx, fdef)) = module.find_function_def_by_name(INIT_FN_NAME.as_str()) else {
+                continue;
+            };
+            let fhandle = module.function_handle_at(fdef.function);
+            let fparameters = module.signature_at(fhandle.parameters);
+            assert_invariant!(
+                fparameters.0.len() <= 2,
+                "init function should have at most 2 parameters"
+            );
+            let has_otw = fparameters.0.len() == 2;
+            let tx_context = CtxValue(Value::tx_context(self.tx_context.borrow().digest())?);
+            let args = if has_otw {
+                vec![CtxValue(Value::one_time_witness()?), tx_context]
+            } else {
+                vec![tx_context]
+            };
             let return_values = self.execute_function_bypass_visibility(
-                &module_id,
+                &module.self_id(),
                 INIT_FN_NAME,
                 &[],
                 args,
@@ -793,7 +818,7 @@ impl<'env, 'pc, 'vm, 'state, 'linkage, 'gas> Context<'env, 'pc, 'vm, 'state, 'li
         // remove it.
         // The call to `pop_last_package` later is fine because we cannot re-enter and
         // the last package we pushed is the one we are verifying and running the init from
-        let linkage = RootedLinkage::new(*package_id, linkage);
+        let linkage = RootedLinkage::new_for_publication(package_id, runtime_id, linkage);
 
         self.env.linkable_store.push_package(package_id, package)?;
         let res = self
@@ -837,7 +862,7 @@ impl<'env, 'pc, 'vm, 'state, 'linkage, 'gas> Context<'env, 'pc, 'vm, 'state, 'li
             dependencies.iter().map(|p| p.move_package()),
         )?;
 
-        let linkage = RootedLinkage::new(*storage_id, linkage);
+        let linkage = RootedLinkage::new_for_publication(storage_id, runtime_id, linkage);
         self.publish_and_verify_modules(runtime_id, &modules, &linkage)?;
 
         legacy_ptb::execution::check_compatibility(
@@ -863,6 +888,16 @@ impl<'env, 'pc, 'vm, 'state, 'linkage, 'gas> Context<'env, 'pc, 'vm, 'state, 'li
         ty: Type,
         object: CtxValue,
     ) -> Result<(), ExecutionError> {
+        self.transfer_object_(recipient, ty, object, /* end of transaction */ false)
+    }
+
+    fn transfer_object_(
+        &mut self,
+        recipient: Owner,
+        ty: Type,
+        object: CtxValue,
+        end_of_transaction: bool,
+    ) -> Result<(), ExecutionError> {
         let tag = TypeTag::try_from(ty)
             .map_err(|_| make_invariant_violation!("Unable to convert Type to TypeTag"))?;
         let TypeTag::Struct(tag) = tag else {
@@ -870,7 +905,7 @@ impl<'env, 'pc, 'vm, 'state, 'linkage, 'gas> Context<'env, 'pc, 'vm, 'state, 'li
         };
         let ty = MoveObjectType::from(*tag);
         object_runtime_mut!(self)?
-            .transfer(recipient, ty, object.0.into())
+            .transfer(recipient, ty, object.0.into(), end_of_transaction)
             .map_err(|e| self.env.convert_vm_error(e.finish(Location::Undefined)))?;
         Ok(())
     }
@@ -901,7 +936,7 @@ impl<'env, 'pc, 'vm, 'state, 'linkage, 'gas> Context<'env, 'pc, 'vm, 'state, 'li
         let Ok(tag): Result<TypeTag, _> = ty.clone().try_into() else {
             invariant_violation!("unable to generate type tag from type")
         };
-        let (_, _, lv) = self.location_value(location, ty)?;
+        let (_, _, _, lv) = self.location_value(location, ty)?;
         let local = match lv {
             LocationValue::Loaded(v) => {
                 if v.is_invalid()? {

@@ -32,6 +32,7 @@ use sui_types::full_checkpoint_content::CheckpointData;
 use sui_types::layout_resolver::LayoutResolver;
 use sui_types::messages_checkpoint::CheckpointContents;
 use sui_types::messages_checkpoint::CheckpointSequenceNumber;
+use sui_types::object::Data;
 use sui_types::object::Object;
 use sui_types::object::Owner;
 use sui_types::storage::error::Error as StorageError;
@@ -49,7 +50,9 @@ use typed_store::traits::Map;
 use typed_store::DBMapUtils;
 use typed_store::TypedStoreError;
 
-const CURRENT_DB_VERSION: u64 = 2;
+const CURRENT_DB_VERSION: u64 = 3;
+// I tried increasing this to 100k and 1M and it didn't speed up indexing at all.
+const BALANCE_FLUSH_THRESHOLD: usize = 10_000;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 struct MetadataInfo {
@@ -185,6 +188,17 @@ impl From<BalanceIndexInfo> for sui_types::storage::BalanceInfo {
     }
 }
 
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Serialize, Deserialize, PartialOrd, Ord)]
+pub struct PackageVersionKey {
+    pub original_package_id: ObjectID,
+    pub version: u64,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Debug)]
+pub struct PackageVersionInfo {
+    pub storage_id: ObjectID,
+}
+
 fn balance_delta_merge_operator(
     _key: &[u8],
     existing_val: Option<&[u8]>,
@@ -284,6 +298,12 @@ struct IndexStoreTables {
     /// Allows looking up balances by owner address and coin type.
     #[default_options_override_fn = "balance_table_options"]
     balance: DBMap<BalanceKey, BalanceIndexInfo>,
+
+    /// An index of Package versions.
+    ///
+    /// Maps original package ID and version to the storage ID of that version.
+    /// Allows efficient listing of all versions of a package.
+    package_version: DBMap<PackageVersionKey, PackageVersionInfo>,
     // NOTE: Authors and Reviewers before adding any new tables ensure that they are either:
     // - bounded in size by the live object set
     // - are prune-able and have corresponding logic in the `prune` function
@@ -310,6 +330,24 @@ impl IndexStoreTables {
             balance_changes.entry(key).or_default().merge_delta(&delta);
         }
         Ok(())
+    }
+
+    fn extract_version_if_package(
+        object: &Object,
+    ) -> Option<(PackageVersionKey, PackageVersionInfo)> {
+        if let Data::Package(package) = &object.data {
+            let original_id = package.original_package_id();
+            let version = package.version().value();
+            let storage_id = object.id();
+
+            let key = PackageVersionKey {
+                original_package_id: original_id,
+                version,
+            };
+            let info = PackageVersionInfo { storage_id };
+            return Some((key, info));
+        }
+        None
     }
 
     fn open<P: Into<PathBuf>>(path: P) -> Self {
@@ -599,6 +637,7 @@ impl IndexStoreTables {
     ) -> Result<(), StorageError> {
         let mut coin_index: HashMap<CoinIndexKey, CoinIndexInfo> = HashMap::new();
         let mut balance_changes: HashMap<BalanceKey, BalanceIndexInfo> = HashMap::new();
+        let mut package_version_index: Vec<(PackageVersionKey, PackageVersionInfo)> = vec![];
 
         for tx in &checkpoint.transactions {
             // determine changes from removed objects
@@ -679,6 +718,9 @@ impl IndexStoreTables {
                     }
                     Owner::Shared { .. } | Owner::Immutable => {}
                 }
+                if let Some((key, info)) = Self::extract_version_if_package(object) {
+                    package_version_index.push((key, info));
+                }
             }
 
             // coin indexing
@@ -702,6 +744,7 @@ impl IndexStoreTables {
 
         batch.insert_batch(&self.coin, coin_index)?;
         batch.partial_merge_batch(&self.balance, balance_changes)?;
+        batch.insert_batch(&self.package_version, package_version_index)?;
 
         Ok(())
     }
@@ -823,6 +866,28 @@ impl IndexStoreTables {
                     Err(e) => Some(Err(e)), // Propagate error
                 }
             }))
+    }
+
+    fn package_versions_iter(
+        &self,
+        original_id: ObjectID,
+        cursor: Option<u64>,
+    ) -> Result<
+        impl Iterator<Item = Result<(PackageVersionKey, PackageVersionInfo), TypedStoreError>> + '_,
+        TypedStoreError,
+    > {
+        let lower_bound = PackageVersionKey {
+            original_package_id: original_id,
+            version: cursor.unwrap_or(0),
+        };
+        let upper_bound = PackageVersionKey {
+            original_package_id: original_id,
+            version: u64::MAX,
+        };
+
+        Ok(self
+            .package_version
+            .safe_iter_with_bounds(Some(lower_bound), Some(upper_bound)))
     }
 }
 
@@ -1021,6 +1086,17 @@ impl RpcIndexStore {
     > {
         self.tables.balance_iter(owner, cursor)
     }
+
+    pub fn package_versions_iter(
+        &self,
+        original_id: ObjectID,
+        cursor: Option<u64>,
+    ) -> Result<
+        impl Iterator<Item = Result<(PackageVersionKey, PackageVersionInfo), TypedStoreError>> + '_,
+        TypedStoreError,
+    > {
+        self.tables.package_versions_iter(original_id, cursor)
+    }
 }
 
 fn try_create_dynamic_field_info(
@@ -1142,6 +1218,7 @@ struct RpcLiveObjectIndexer<'a> {
     coin_index: &'a Mutex<HashMap<CoinIndexKey, CoinIndexInfo>>,
     resolver: Box<dyn LayoutResolver + 'a>,
     object_store: &'a (dyn ObjectStore + Sync),
+    balance_changes: HashMap<BalanceKey, BalanceIndexInfo>,
 }
 
 impl<'a> ParMakeLiveObjectIndexer for RpcParLiveObjectSetIndexer<'a> {
@@ -1157,6 +1234,7 @@ impl<'a> ParMakeLiveObjectIndexer for RpcParLiveObjectSetIndexer<'a> {
                 .executor()
                 .type_layout_resolver(Box::new(self.package_store)),
             object_store: self.object_store,
+            balance_changes: HashMap::new(),
         }
     }
 }
@@ -1171,12 +1249,20 @@ impl LiveObjectIndexer for RpcLiveObjectIndexer<'_> {
                 self.batch
                     .insert_batch(&self.tables.owner, [(owner_key, owner_info)])?;
 
-                // Track balance for coins
                 if let Some((coin_type, value)) = get_balance_and_type_if_coin(&object)? {
                     let balance_key = BalanceKey { owner, coin_type };
                     let balance_info = BalanceIndexInfo::from(value);
-                    self.batch
-                        .partial_merge_batch(&self.tables.balance, [(balance_key, balance_info)])?;
+                    self.balance_changes
+                        .entry(balance_key)
+                        .or_default()
+                        .merge_delta(&balance_info);
+
+                    if self.balance_changes.len() >= BALANCE_FLUSH_THRESHOLD {
+                        self.batch.partial_merge_batch(
+                            &self.tables.balance,
+                            std::mem::take(&mut self.balance_changes),
+                        )?;
+                    }
                 }
             }
 
@@ -1211,6 +1297,11 @@ impl LiveObjectIndexer for RpcLiveObjectIndexer<'_> {
             }
         }
 
+        if let Some((key, info)) = IndexStoreTables::extract_version_if_package(&object) {
+            self.batch
+                .insert_batch(&self.tables.package_version, [(key, info)])?;
+        }
+
         // If the batch size grows to greater that 128MB then write out to the DB so that the
         // data we need to hold in memory doesn't grown unbounded.
         if self.batch.size_in_bytes() >= 1 << 27 {
@@ -1220,7 +1311,11 @@ impl LiveObjectIndexer for RpcLiveObjectIndexer<'_> {
         Ok(())
     }
 
-    fn finish(self) -> Result<(), StorageError> {
+    fn finish(mut self) -> Result<(), StorageError> {
+        self.batch.partial_merge_batch(
+            &self.tables.balance,
+            std::mem::take(&mut self.balance_changes),
+        )?;
         self.batch.write()?;
         Ok(())
     }

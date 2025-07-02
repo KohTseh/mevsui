@@ -12,15 +12,13 @@ use std::{
 };
 
 use consensus_config::AuthorityIndex;
+use consensus_types::block::{BlockDigest, BlockRef, BlockTimestampMs, Round};
 use itertools::Itertools as _;
 use tokio::time::Instant;
 use tracing::{debug, error, info, trace};
 
 use crate::{
-    block::{
-        genesis_blocks, BlockAPI, BlockDigest, BlockRef, BlockTimestampMs, Round, Slot,
-        VerifiedBlock, GENESIS_ROUND,
-    },
+    block::{genesis_blocks, BlockAPI, Slot, VerifiedBlock, GENESIS_ROUND},
     commit::{
         load_committed_subdag_from_store, CommitAPI as _, CommitDigest, CommitIndex, CommitInfo,
         CommitRef, CommitVote, TrustedCommit, GENESIS_COMMIT_INDEX,
@@ -900,8 +898,14 @@ impl DagState {
 
     /// Recovers commits to write from storage, at startup.
     pub(crate) fn recover_commits_to_write(&mut self, commits: Vec<TrustedCommit>) {
-        assert!(self.commits_to_write.is_empty());
         self.commits_to_write.extend(commits);
+    }
+
+    pub(crate) fn ensure_commits_to_write_is_empty(&self) {
+        assert!(
+            self.commits_to_write.is_empty(),
+            "Commits to write should be empty"
+        );
     }
 
     pub(crate) fn add_commit_info(&mut self, reputation_scores: ReputationScores) {
@@ -1220,11 +1224,12 @@ impl BlockInfo {
 mod test {
     use std::vec;
 
+    use consensus_types::block::{BlockDigest, BlockRef, BlockTimestampMs};
     use parking_lot::RwLock;
 
     use super::*;
     use crate::{
-        block::{BlockDigest, BlockRef, BlockTimestampMs, TestBlock, VerifiedBlock},
+        block::{TestBlock, VerifiedBlock},
         storage::{mem_store::MemStore, WriteBatch},
         test_dag_builder::DagBuilder,
         test_dag_parser::parse_dag,

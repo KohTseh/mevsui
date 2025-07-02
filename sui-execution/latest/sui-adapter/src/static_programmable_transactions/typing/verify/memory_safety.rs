@@ -103,8 +103,8 @@ impl Context {
         self.graph.borrowed_by(r).map_err(graph_err)
     }
 
-    /// Used for checking if a location is borrowed, primarily for recording this information on
-    /// a specific Copy instance
+    /// Used for checking if a location is borrowed
+    /// Used for updating the borrowed marker in Copy, and for correctness of Move
     fn is_location_borrowed(&self, l: T::Location) -> Result<bool, ExecutionError> {
         let borrowed_by = self.borrowed_by(self.local_root)?;
         Ok(borrowed_by
@@ -210,7 +210,10 @@ pub fn verify(_env: &Env, ast: &T::Transaction) -> Result<(), ExecutionError> {
     for (c, t) in commands {
         let result =
             command(&mut context, c, t).map_err(|e| e.with_command_index(c.idx as usize))?;
-        assert_invariant!(result.len() == t.len(), "result length mismatch");
+        assert_invariant!(
+            result.len() == t.len(),
+            "result length mismatch for command. {c:?}"
+        );
         context.results.push(result.into_iter().map(Some).collect());
     }
 
@@ -277,7 +280,7 @@ fn command(
             let coin_values = arguments(context, coins)?;
             consume_values(context, coin_values)?;
             write_ref(context, 0, target_value)?;
-            vec![Value::NonRef]
+            vec![]
         }
         T::Command_::MakeMoveVec(_, xs) => {
             let vs = arguments(context, xs)?;
@@ -343,6 +346,13 @@ fn move_value(
     arg_idx: u16,
     l: T::Location,
 ) -> Result<Value, ExecutionError> {
+    if context.is_location_borrowed(l)? {
+        // TODO more specific error
+        return Err(command_argument_error(
+            CommandArgumentError::InvalidValueUsage,
+            arg_idx as usize,
+        ));
+    }
     let Some(value) = context.location(l).take() else {
         return Err(command_argument_error(
             CommandArgumentError::InvalidValueUsage,

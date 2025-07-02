@@ -63,6 +63,7 @@ pub struct Local<'a>(&'a mut Locals, u16);
 /// A set of memory locations that can be borrowed or moved from. Used for inputs and results
 pub struct Locals(VMLocals);
 
+#[derive(Debug)]
 pub struct Value(VMValue);
 
 impl Inputs {
@@ -288,7 +289,7 @@ impl Value {
 
     pub fn receiving(id: ObjectID, version: SequenceNumber) -> Self {
         Self(VMValue::struct_(Struct::pack([
-            Self::uid(id.into()).0,
+            Self::id(id.into()).0,
             VMValue::u64(version.into()),
         ])))
     }
@@ -330,6 +331,13 @@ impl Value {
             VMValue::u64(0),
             VMValue::u64(0),
         ]))))
+    }
+
+    pub fn one_time_witness() -> Result<Self, ExecutionError> {
+        // public struct <ONE_TIME_WITNESS> has drop{
+        //     _dummy: bool,
+        // }
+        Ok(Self(VMValue::struct_(Struct::pack([VMValue::bool(true)]))))
     }
 }
 

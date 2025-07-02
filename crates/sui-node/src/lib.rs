@@ -31,11 +31,14 @@ use sui_core::authority::authority_store_tables::{
 use sui_core::authority::backpressure::BackpressureManager;
 use sui_core::authority::epoch_start_configuration::EpochFlag;
 use sui_core::authority::execution_time_estimator::ExecutionTimeObserver;
+use sui_core::authority::shared_object_version_manager::Schedulable;
+use sui_core::authority::ExecutionEnv;
 use sui_core::authority::RandomnessRoundReceiver;
 use sui_core::consensus_adapter::ConsensusClient;
 use sui_core::consensus_manager::UpdatableConsensusClient;
 use sui_core::epoch::randomness::RandomnessManager;
 use sui_core::execution_cache::build_execution_cache;
+use sui_core::execution_scheduler::ExecutionSchedulerAPI;
 use sui_core::execution_scheduler::SchedulingSource;
 use sui_core::global_state_hasher::GlobalStateHashMetrics;
 use sui_core::storage::RestReadStore;
@@ -152,7 +155,7 @@ pub mod metrics;
 pub struct ValidatorComponents {
     validator_server_handle: SpawnOnce,
     validator_overload_monitor_handle: Option<JoinHandle<()>>,
-    consensus_manager: ConsensusManager,
+    consensus_manager: Arc<ConsensusManager>,
     consensus_store_pruner: ConsensusStorePruner,
     consensus_adapter: Arc<ConsensusAdapter>,
     // Keeping the handle to the checkpoint service tasks to shut them down during reconfiguration.
@@ -757,9 +760,8 @@ impl SuiNode {
             state
                 .try_execute_immediately(
                     &transaction,
-                    None,
+                    ExecutionEnv::new().with_scheduling_source(SchedulingSource::NonFastPath),
                     &epoch_store,
-                    SchedulingSource::NonFastPath,
                 )
                 .instrument(span)
                 .await
@@ -1237,8 +1239,12 @@ impl SuiNode {
             client.clone(),
             checkpoint_store.clone(),
         ));
-        let consensus_manager =
-            ConsensusManager::new(&config, consensus_config, registry_service, client);
+        let consensus_manager = Arc::new(ConsensusManager::new(
+            &config,
+            consensus_config,
+            registry_service,
+            client,
+        ));
 
         // This only gets started up once, not on every epoch. (Make call to remove every epoch.)
         let consensus_store_pruner = ConsensusStorePruner::new(
@@ -1307,7 +1313,7 @@ impl SuiNode {
         epoch_store: Arc<AuthorityPerEpochStore>,
         state_sync_handle: state_sync::Handle,
         randomness_handle: randomness::Handle,
-        consensus_manager: ConsensusManager,
+        consensus_manager: Arc<ConsensusManager>,
         consensus_store_pruner: ConsensusStorePruner,
         state_hasher: Weak<GlobalStateHasher>,
         backpressure_manager: Arc<BackpressureManager>,
@@ -1383,34 +1389,39 @@ impl SuiNode {
             backpressure_manager,
         );
 
-        info!("Starting consensus manager");
+        info!("Starting consensus manager asynchronously");
 
-        consensus_manager
-            .start(
-                config,
-                epoch_store.clone(),
-                consensus_handler_initializer,
-                SuiTxValidator::new(
-                    state.clone(),
-                    consensus_adapter.clone(),
-                    checkpoint_service.clone(),
-                    sui_tx_validator_metrics.clone(),
-                ),
-            )
-            .await;
-        let consensus_replay_waiter = consensus_manager.replay_waiter();
-
-        if !epoch_store
-            .epoch_start_config()
-            .is_data_quarantine_active_from_beginning_of_epoch()
-        {
-            checkpoint_store
-                .reexecute_local_checkpoints(&state, &epoch_store)
-                .await;
-        }
+        // Spawn consensus startup asynchronously to avoid blocking other components
+        tokio::spawn({
+            let config = config.clone();
+            let epoch_store = epoch_store.clone();
+            let sui_tx_validator = SuiTxValidator::new(
+                state.clone(),
+                consensus_adapter.clone(),
+                checkpoint_service.clone(),
+                sui_tx_validator_metrics.clone(),
+            );
+            let consensus_manager = consensus_manager.clone();
+            async move {
+                consensus_manager
+                    .start(
+                        &config,
+                        epoch_store,
+                        consensus_handler_initializer,
+                        sui_tx_validator,
+                    )
+                    .await;
+            }
+        });
+        let replay_waiter = consensus_manager.replay_waiter();
 
         info!("Spawning checkpoint service");
-        let checkpoint_service_tasks = checkpoint_service.spawn(consensus_replay_waiter).await;
+        let replay_waiter = if std::env::var("DISABLE_REPLAY_WAITER").is_ok() {
+            None
+        } else {
+            Some(replay_waiter)
+        };
+        let checkpoint_service_tasks = checkpoint_service.spawn(replay_waiter).await;
 
         if epoch_store.authenticator_state_enabled() {
             Self::start_jwk_updater(
@@ -1578,9 +1589,7 @@ impl SuiNode {
             match tx.kind {
                 // Shared object txns cannot be re-executed at this point, because we must wait for
                 // consensus replay to assign shared object versions.
-                ConsensusTransactionKind::CertifiedTransaction(tx)
-                    if !tx.contains_shared_object() =>
-                {
+                ConsensusTransactionKind::CertifiedTransaction(tx) if !tx.is_consensus_tx() => {
                     let tx = *tx;
                     // new_unchecked is safe because we never submit a transaction to consensus
                     // without verifying it
@@ -1593,9 +1602,16 @@ impl SuiNode {
                         .get_signed_effects_digest(tx.digest())
                         .expect("db error")
                     {
-                        pending_consensus_certificates.push((tx, fx_digest));
+                        pending_consensus_certificates.push((
+                            Schedulable::Transaction(tx),
+                            ExecutionEnv::new().with_expected_effects_digest(fx_digest),
+                        ));
                     } else {
-                        additional_certs.push(tx);
+                        additional_certs.push((
+                            Schedulable::Transaction(tx),
+                            ExecutionEnv::new()
+                                .with_scheduling_source(SchedulingSource::NonFastPath),
+                        ));
                     }
                 }
                 _ => (),
@@ -1604,7 +1620,8 @@ impl SuiNode {
 
         let digests = pending_consensus_certificates
             .iter()
-            .map(|(tx, _)| *tx.digest())
+            // unwrap_digest okay because only user certs are in pending_consensus_certificates
+            .map(|(tx, _)| *tx.key().unwrap_digest())
             .collect::<Vec<_>>();
 
         info!(
@@ -1613,8 +1630,12 @@ impl SuiNode {
             digests
         );
 
-        state.enqueue_with_expected_effects_digest(pending_consensus_certificates, epoch_store);
-        state.enqueue_transactions_for_execution(additional_certs, epoch_store);
+        state
+            .execution_scheduler()
+            .enqueue(pending_consensus_certificates, epoch_store);
+        state
+            .execution_scheduler()
+            .enqueue(additional_certs, epoch_store);
 
         // If this times out, the validator will still almost certainly start up fine. But, it is
         // possible that it may temporarily "forget" about transactions that it had previously

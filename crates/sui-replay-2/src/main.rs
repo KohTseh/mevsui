@@ -8,12 +8,13 @@ use core::panic;
 use move_trace_format::format::MoveTraceBuilder;
 use similar::{ChangeTag, TextDiff};
 use std::path::PathBuf;
+use sui_replay_2::build::handle_build_command;
 use sui_replay_2::{
     data_store::DataStore,
     execution::execute_transaction_to_effects,
     replay_txn::ReplayTransaction,
     tracing::{get_trace_output_path, save_trace_output},
-    ReplayConfig,
+    Commands, Config, ReplayConfig,
 };
 use sui_types::{effects::TransactionEffects, gas::SuiGasStatus};
 use tracing::debug;
@@ -26,8 +27,23 @@ fn main() -> anyhow::Result<()> {
         .with_env()
         .init();
 
-    let config = ReplayConfig::parse();
+    let config = Config::parse();
     debug!("Parsed config: {:#?}", config);
+
+    match config.command {
+        Some(Commands::Build(build_config)) => {
+            handle_build_command(build_config)?;
+        }
+        None => {
+            // Default to replay behavior when no subcommand is specified
+            handle_replay_command(config.replay)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn handle_replay_command(config: ReplayConfig) -> anyhow::Result<()> {
     let ReplayConfig {
         node,
         digest,
@@ -93,26 +109,23 @@ fn replay_transaction(
 
     // replay the transaction
     let mut trace_builder_opt = trace.clone().map(|_| MoveTraceBuilder::new());
-    let (result, effects, gas_status, expected_effects, object_cache) =
-        match execute_transaction_to_effects(
-            replay_txn,
-            data_store,
-            data_store,
-            &mut trace_builder_opt,
-        ) {
-            Ok((result, effects, gas_status, expected_effects, object_cache)) => {
-                (result, effects, gas_status, expected_effects, object_cache)
-            }
-            Err(e) => {
-                println!("** TRANSACTION {} failed to execute -> {:?}", tx_digest, e);
-                return;
-            }
-        };
+    let (result, context_and_effects) = match execute_transaction_to_effects(
+        replay_txn,
+        data_store,
+        data_store,
+        &mut trace_builder_opt,
+    ) {
+        Ok((result, context_and_effects)) => (result, context_and_effects),
+        Err(e) => {
+            println!("** TRANSACTION {} failed to execute -> {:?}", tx_digest, e);
+            return;
+        }
+    };
 
     // TODO: make tracing better abstracted? different tracers?
     if let Some(trace_builder) = trace_builder_opt {
         let _ = get_trace_output_path(trace.unwrap())
-            .and_then(|output_path| save_trace_output(&output_path, tx_digest, trace_builder, object_cache))
+            .and_then(|output_path| save_trace_output(&output_path, tx_digest, trace_builder, &context_and_effects))
             .map_err(|e| {
                 println!(
                     "WARNING (skipping tracing): transaction {} failed to build a trace output path -> {:?}",
@@ -125,10 +138,16 @@ fn replay_transaction(
     // print results
     println!("** TRANSACTION {} -> {:?}", tx_digest, result);
     if show_effects {
-        print_txn_effects(&effects, &gas_status);
+        print_txn_effects(
+            &context_and_effects.execution_effects,
+            &context_and_effects.gas_status,
+        );
     }
     if verify {
-        verify_txn(&expected_effects, &effects);
+        verify_txn(
+            &context_and_effects.expected_effects,
+            &context_and_effects.execution_effects,
+        );
     }
 }
 

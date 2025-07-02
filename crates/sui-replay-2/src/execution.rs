@@ -32,9 +32,10 @@ use sui_types::{
     effects::{TransactionEffects, TransactionEffectsAPI},
     error::{ExecutionError, SuiError, SuiResult},
     gas::SuiGasStatus,
+    inner_temporary_store::InnerTemporaryStore,
     metrics::LimitsMetrics,
     object::Object,
-    storage::{BackingPackageStore, ChildObjectResolver, ConfigStore, PackageObject, ParentSync},
+    storage::{BackingPackageStore, ChildObjectResolver, PackageObject, ParentSync},
     supported_protocol_versions::ProtocolConfig,
     transaction::{CheckedInputObjects, TransactionDataAPI},
 };
@@ -45,6 +46,17 @@ pub struct ReplayExecutor {
     protocol_config: ProtocolConfig,
     executor: Arc<dyn Executor + Send + Sync>,
     metrics: Arc<LimitsMetrics>,
+}
+
+// Returned struct from execution. Contains all the data related to a transaction.
+// Transaction data and effects (both expected and actual) and the caches containing
+// the objects used during execution.
+pub struct TxnContextAndEffects {
+    pub execution_effects: TransactionEffects, // effects of the replay execution
+    pub expected_effects: TransactionEffects,  // expected effects as found in the transaction data
+    pub gas_status: SuiGasStatus,              // gas status of the replay execution
+    pub object_cache: BTreeMap<ObjectID, BTreeMap<u64, Object>>, // object cache
+    pub inner_store: InnerTemporaryStore,      // temporary store used during execution
 }
 
 // Entry point. Executes a transaction.
@@ -58,11 +70,8 @@ pub fn execute_transaction_to_effects(
     trace_builder_opt: &mut Option<MoveTraceBuilder>,
 ) -> Result<
     (
-        Result<(), ExecutionError>,                // transaction result
-        TransactionEffects,                        // effects of the replay execution
-        SuiGasStatus,                              // gas status of the replay execution
-        TransactionEffects, // expected effects as found in the transaction data
-        BTreeMap<ObjectID, BTreeMap<u64, Object>>, // object cache
+        Result<(), ExecutionError>, // transaction result
+        TxnContextAndEffects,       // data touched and changed during execution
     ),
     anyhow::Error,
 > {
@@ -100,7 +109,7 @@ pub fn execute_transaction_to_effects(
         store: object_store,
         object_cache: RefCell::new(object_cache),
     };
-    let (_inner_store, gas_status, effects, _execution_timing, result) =
+    let (inner_store, gas_status, effects, _execution_timing, result) =
         executor.executor.execute_transaction_to_effects(
             &store,
             protocol_config,
@@ -124,7 +133,16 @@ pub fn execute_transaction_to_effects(
     } = store;
     let object_cache = object_cache.into_inner();
     debug!("End execution");
-    Ok((result, effects, gas_status, expected_effects, object_cache))
+    Ok((
+        result,
+        TxnContextAndEffects {
+            execution_effects: effects,
+            expected_effects,
+            gas_status,
+            object_cache,
+            inner_store,
+        },
+    ))
 }
 
 impl ReplayExecutor {
@@ -195,33 +213,6 @@ impl ReplayStore<'_> {
         }
 
         object
-    }
-}
-
-impl ConfigStore for ReplayStore<'_> {
-    fn get_current_epoch_stable_sequence_number(
-        &self,
-        object_id: &ObjectID,
-        _epoch_id: EpochId,
-    ) -> Option<VersionNumber> {
-        let object_key = ObjectKey {
-            object_id: *object_id,
-            // we could have used `VersionQuery::ImmutableOrLatest`
-            // but we would have to track system packages separetly
-            // which we may want to consider
-            version_query: VersionQuery::AtCheckpoint(self.checkpoint),
-        };
-
-        let object = self
-            .store
-            .get_objects(&[object_key])
-            .expect("Storage error");
-        debug_assert!(object.len() == 1, "Expected one object for {}", object_id);
-        let object = object.into_iter().next().unwrap().unwrap();
-        // Return the version of the object as the stable sequence number -- this is fine as we
-        // just need a sequence number in the in order to fetch a workable version of the object
-        // for replay and not necessarily the actual epoch-stable sequence number.
-        Some(object.version())
     }
 }
 

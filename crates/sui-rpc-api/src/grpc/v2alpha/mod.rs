@@ -4,8 +4,8 @@
 use std::pin::Pin;
 
 use crate::field_mask::FieldMaskTree;
-use crate::message::MessageMergeFrom;
 use crate::proto::rpc::v2alpha::live_data_service_server::LiveDataService;
+use crate::proto::rpc::v2alpha::move_package_service_server::MovePackageService;
 use crate::proto::rpc::v2alpha::signature_verification_service_server::SignatureVerificationService;
 use crate::proto::rpc::v2alpha::subscription_service_server::SubscriptionService;
 use crate::proto::rpc::v2alpha::GetBalanceRequest;
@@ -24,7 +24,11 @@ use crate::proto::rpc::v2alpha::SubscribeCheckpointsRequest;
 use crate::proto::rpc::v2alpha::SubscribeCheckpointsResponse;
 use crate::proto::rpc::v2alpha::VerifySignatureRequest;
 use crate::proto::rpc::v2alpha::VerifySignatureResponse;
-use crate::proto::rpc::v2beta::Checkpoint;
+use crate::proto::rpc::v2alpha::{
+    GetDatatypeRequest, GetDatatypeResponse, GetFunctionRequest, GetFunctionResponse,
+    GetModuleRequest, GetModuleResponse, GetPackageRequest, GetPackageResponse,
+    ListPackageVersionsRequest, ListPackageVersionsResponse,
+};
 use crate::subscription::SubscriptionServiceHandle;
 use crate::RpcService;
 
@@ -53,12 +57,20 @@ impl SubscriptionService for SubscriptionServiceHandle {
 
         let response = Box::pin(async_stream::stream! {
             while let Some(checkpoint) = receiver.recv().await {
-                let Some(cursor) = checkpoint.sequence_number else {
-                    yield Err(tonic::Status::internal("unable to determine cursor"));
-                    break;
+                let cursor = checkpoint.checkpoint_summary.sequence_number;
+
+                let checkpoint = match crate::grpc::v2beta::ledger_service::get_checkpoint::checkpoint_data_to_checkpoint_proto(
+                    checkpoint.as_ref().to_owned(), // TODO optimize so checkpoint isn't cloned
+                    &read_mask
+                ) {
+                    Ok(checkpoint) => checkpoint,
+                    Err(e) => {
+                        tracing::error!("unable to convert checkpoint to proto: {e:?}");
+                        yield Err(tonic::Status::internal("unable to convert checkpoint to proto {e:?}"));
+                        break;
+                    }
                 };
 
-                let checkpoint = Checkpoint::merge_from(checkpoint.as_ref(), &read_mask);
                 let response = SubscribeCheckpointsResponse {
                     cursor: Some(cursor),
                     checkpoint: Some(checkpoint),
@@ -77,6 +89,7 @@ mod get_coin_info;
 mod list_balances;
 mod list_dynamic_fields;
 mod list_owned_objects;
+mod move_package;
 mod simulate;
 
 #[tonic::async_trait]
@@ -145,6 +158,54 @@ impl SignatureVerificationService for RpcService {
         request: tonic::Request<VerifySignatureRequest>,
     ) -> Result<tonic::Response<VerifySignatureResponse>, tonic::Status> {
         verify_signature::verify_signature(self, request.into_inner())
+            .map(tonic::Response::new)
+            .map_err(Into::into)
+    }
+}
+
+#[tonic::async_trait]
+impl MovePackageService for RpcService {
+    async fn get_package(
+        &self,
+        request: tonic::Request<GetPackageRequest>,
+    ) -> Result<tonic::Response<GetPackageResponse>, tonic::Status> {
+        move_package::get_package::get_package(self, request.into_inner())
+            .map(tonic::Response::new)
+            .map_err(Into::into)
+    }
+
+    async fn get_module(
+        &self,
+        request: tonic::Request<GetModuleRequest>,
+    ) -> Result<tonic::Response<GetModuleResponse>, tonic::Status> {
+        move_package::get_module::get_module(self, request.into_inner())
+            .map(tonic::Response::new)
+            .map_err(Into::into)
+    }
+
+    async fn get_datatype(
+        &self,
+        request: tonic::Request<GetDatatypeRequest>,
+    ) -> Result<tonic::Response<GetDatatypeResponse>, tonic::Status> {
+        move_package::get_datatype::get_datatype(self, request.into_inner())
+            .map(tonic::Response::new)
+            .map_err(Into::into)
+    }
+
+    async fn get_function(
+        &self,
+        request: tonic::Request<GetFunctionRequest>,
+    ) -> Result<tonic::Response<GetFunctionResponse>, tonic::Status> {
+        move_package::get_function::get_function(self, request.into_inner())
+            .map(tonic::Response::new)
+            .map_err(Into::into)
+    }
+
+    async fn list_package_versions(
+        &self,
+        request: tonic::Request<ListPackageVersionsRequest>,
+    ) -> Result<tonic::Response<ListPackageVersionsResponse>, tonic::Status> {
+        move_package::list_package_versions::list_package_versions(self, request.into_inner())
             .map(tonic::Response::new)
             .map_err(Into::into)
     }

@@ -61,6 +61,7 @@ mod checked {
         error::{ExecutionError, ExecutionErrorKind, SuiError, command_argument_error},
         event::Event,
         execution::{ExecutionResults, ExecutionResultsV2},
+        execution_config_utils::to_binary_config,
         execution_status::CommandArgumentError,
         metrics::LimitsMetrics,
         move_package::MovePackage,
@@ -1191,6 +1192,28 @@ mod checked {
                 SizeBound::Object(bound)
             }
         }
+
+        pub(crate) fn deserialize_modules(
+            &self,
+            module_bytes: &[Vec<u8>],
+        ) -> Result<Vec<CompiledModule>, ExecutionError> {
+            let binary_config = to_binary_config(self.protocol_config);
+            let modules = module_bytes
+                .iter()
+                .map(|b| {
+                    CompiledModule::deserialize_with_config(b, &binary_config)
+                        .map_err(|e| e.finish(Location::Undefined))
+                })
+                .collect::<VMResult<Vec<CompiledModule>>>()
+                .map_err(|e| self.convert_vm_error(e))?;
+
+            assert_invariant!(
+                !modules.is_empty(),
+                "input checker ensures package is not empty"
+            );
+
+            Ok(modules)
+        }
     }
 
     impl Arg {
@@ -1634,6 +1657,10 @@ mod checked {
                 input_object_map,
                 obj_arg,
             )?,
+            CallArg::BalanceWithdraw(_) => {
+                // TODO(address-balances): Add support for balance withdraws.
+                todo!("Load balance withdraw call arg")
+            }
         })
     }
 

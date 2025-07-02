@@ -560,10 +560,7 @@ impl From<UnchangedSharedKind> for crate::effects::UnchangedSharedKind {
                 Self::ReadConsensusStreamEnded(version.into())
             }
             UnchangedSharedKind::Canceled { version } => Self::Cancelled(version.into()),
-            UnchangedSharedKind::PerEpochConfig => Self::PerEpochConfigDEPRECATED,
-            UnchangedSharedKind::PerEpochConfigWithSequenceNumber { version } => {
-                Self::PerEpochConfigWithSeqno(version.into())
-            }
+            UnchangedSharedKind::PerEpochConfig => Self::PerEpochConfig,
         }
     }
 }
@@ -590,12 +587,7 @@ impl From<crate::effects::UnchangedSharedKind> for UnchangedSharedKind {
             crate::effects::UnchangedSharedKind::Cancelled(version) => Self::Canceled {
                 version: version.into(),
             },
-            crate::effects::UnchangedSharedKind::PerEpochConfigDEPRECATED => Self::PerEpochConfig,
-            crate::effects::UnchangedSharedKind::PerEpochConfigWithSeqno(seqno) => {
-                Self::PerEpochConfigWithSequenceNumber {
-                    version: seqno.into(),
-                }
-            }
+            crate::effects::UnchangedSharedKind::PerEpochConfig => Self::PerEpochConfig,
         }
     }
 }
@@ -760,6 +752,10 @@ impl From<crate::execution_status::CommandArgumentError> for CommandArgumentErro
             crate::execution_status::CommandArgumentError::InvalidObjectByMutRef => Self::InvalidObjectByMutRef,
             crate::execution_status::CommandArgumentError::SharedObjectOperationNotAllowed => Self::SharedObjectOperationNotAllowed,
             crate::execution_status::CommandArgumentError::InvalidArgumentArity => Self::InvalidArgumentArity,
+            crate::execution_status::CommandArgumentError::InvalidTransferObject |
+            crate::execution_status::CommandArgumentError::InvalidMakeMoveVecNonObjectArgument => {
+                todo!("New errors need to be added to SDK once stabilized")
+            }
         }
     }
 }
@@ -1149,6 +1145,10 @@ impl From<crate::transaction::CallArg> for Input {
                     ObjectReference::new(id.into(), version.value(), digest.into()),
                 ),
             },
+            crate::transaction::CallArg::BalanceWithdraw(_) => {
+                // TODO(address-balances): Add support for balance withdraws.
+                todo!("Convert balance withdraw reservation to sdk Input")
+            }
         }
     }
 }
