@@ -547,6 +547,73 @@ pub fn derive_dbmap_utils_general(input: TokenStream) -> TokenStream {
                     ) -> #secondary_db_map_struct_name #generics {
                     #secondary_db_map_struct_name::open_tables_read_only(primary_path, with_secondary_path, metric_conf, global_db_options_override)
                 }
+
+                /// Opens the database in read-only mode but returns the original struct type.
+                /// 
+                /// This method opens the database tables in read-only mode using a secondary path
+                /// (temporary directory) but returns the same struct type as read-write operations.
+                /// 
+                /// # Warning
+                /// The returned struct has a read-write interface but the underlying database
+                /// is opened in read-only mode. Write operations will fail at runtime.
+                /// 
+                /// # Parameters
+                /// - `path`: Primary database path to open in read-only mode
+                /// - `metric_conf`: Metrics configuration for monitoring
+                /// - `global_db_options_override`: Optional global database options override
+                /// - `tables_db_options_override`: Optional per-table database options override
+                /// 
+                /// # Implementation Details
+                /// Uses a temporary directory as the secondary path for RocksDB's read-only mode,
+                /// which allows multiple processes to access the same database safely.
+                pub fn open_tables_read_only_as_rw_impl(
+                    path: std::path::PathBuf,
+                    metric_conf: typed_store::rocks::MetricConf,
+                    global_db_options_override: Option<typed_store::rocksdb::Options>,
+                    tables_db_options_override: Option<typed_store::rocks::DBMapTableConfigMap>,
+                ) -> Self {
+                    let inner = #intermediate_db_map_struct_name::open_tables_impl(
+                        path,
+                        Some(tempfile::tempdir().expect("Failed to open temporary directory").into_path()),
+                        metric_conf,
+                        global_db_options_override,
+                        tables_db_options_override,
+                        false,
+                    );
+                    Self {
+                        #(
+                            #field_names: inner.#field_names,
+                        )*
+                    }
+                }
+
+                /// Creates a new read-write handle from an existing instance using read-only mode.
+                /// 
+                /// This method creates a new instance that appears to be read-write but is actually
+                /// backed by read-only database access. It's a convenience wrapper around
+                /// `open_tables_read_only_as_rw_impl`.
+                /// 
+                /// # Warning
+                /// The returned instance has a read-write interface but write operations will
+                /// fail at runtime since the underlying database is opened in read-only mode.
+                /// 
+                /// # Parameters
+                /// - `primary_path`: Path to the primary database to open in read-only mode
+                /// - `metric_conf`: Metrics configuration for the new instance
+                /// 
+                /// # Returns
+                /// A new instance with read-write interface but read-only behavior
+                /// 
+                /// # Use Cases
+                /// - Converting from a read-only handle to a "read-write" handle for API compatibility
+                /// - Creating additional handles with different metric configurations
+                pub fn get_rw_handle_readonly_inner(
+                    &self,
+                    primary_path: std::path::PathBuf,
+                    metric_conf: typed_store::rocks::MetricConf,
+                ) -> Self {
+                    Self::open_tables_read_only_as_rw_impl(primary_path, metric_conf, None, None)
+                }
             }
             #secondary_code
         })

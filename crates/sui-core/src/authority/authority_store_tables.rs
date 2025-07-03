@@ -373,6 +373,33 @@ impl AuthorityPerpetualTables {
         )
     }
 
+    /// Opens the database in read-only mode but returns a read-write interface.
+    /// 
+    /// # Warning
+    /// Despite returning a read-write interface, the underlying database is opened
+    /// in read-only mode. Any write operations will fail at runtime.
+    /// 
+    /// # Use Cases
+    /// This method is useful when you need to use APIs that require a read-write
+    /// interface but only perform read operations, such as:
+    /// - Indexing operations that need the full interface but don't modify data
+    /// - Testing scenarios where you want to ensure no writes occur
+    /// - Tools that work with the read-write interface for compatibility
+    /// 
+    /// # Parameters
+    /// - `parent_path`: Path to the parent directory containing the database
+    /// 
+    /// # Returns
+    /// An `AuthorityPerpetualTables` instance with read-write interface but read-only behavior
+    pub fn open_readonly_as_rw(parent_path: &Path) -> Self {
+        Self::open_tables_read_only_as_rw_impl(
+            Self::path(parent_path),
+            MetricConf::new("perpetual_readonly_as_rw"),
+            None,
+            None,
+        )
+    }
+
     // This is used by indexer to find the correct version of dynamic field child object.
     // We do not store the version of the child object, but because of lamport timestamp,
     // we know the child must have version number less then or eq to the parent.
