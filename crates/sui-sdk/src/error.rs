@@ -31,6 +31,8 @@ pub enum Error {
         client_version: String,
         server_version: String,
     },
+    #[error("IPC error: {0}")]
+    IpcError(String),
     #[error("Insufficient fund for address [{address}], requested amount: {amount}")]
     InsufficientFund { address: SuiAddress, amount: u128 },
     #[error("Invalid signature")]
